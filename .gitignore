@@ -1,0 +1,19 @@
+# Rubrik service account credentials - never commit these
+polaris-service-account.json
+*service-account*.json
+
+# Real customer/tenant data exports - do not commit
+Selected sites for test backup.csv
+
+# Any other CSVs except the sanitized sample
+*.csv
+!sample-input.csv
+
+# Google Docs shortcut files (not real content)
+*.gdoc
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+*.swp
