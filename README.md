@@ -1,12 +1,14 @@
 # rubrik-m365-assign-sla
 
-A PowerShell script and workflow for bulk-assigning Rubrik SLA Domains to Microsoft 365 SharePoint sites in Rubrik Security Cloud (RSC), built on top of Rubrik's [`polaris-o365-powershell`](https://github.com/rubrikinc/polaris-o365-powershell) module.
+![CI](https://github.com/pfguglielmi/rubrik-m365-assign-sla/actions/workflows/ci.yml/badge.svg)
 
-It supports two modes:
-- Assign an SLA Domain to a **single SharePoint site** by URL.
-- **Bulk-assign** an SLA Domain to a list of SharePoint sites supplied via a CSV input file.
+A PowerShell script for bulk-assigning Rubrik SLA Domains to Microsoft 365 objects in Rubrik Security Cloud (RSC), built on top of Rubrik's [`polaris-o365-powershell`](https://github.com/rubrikinc/polaris-o365-powershell) module.
 
-Either mode can also assign the special value `UNPROTECTED`, which instead makes the target site(s) inherit the SLA Domain from their parent object.
+It supports two targeting modes, for SharePoint sites, OneDrive accounts, or mailboxes (`-ObjectType`):
+- Assign an SLA Domain to a **single object** by identifier (`-SearchByUrl`).
+- **Bulk-assign** an SLA Domain to a list of objects supplied via a CSV input file (`-InputFile`).
+
+Either mode can also assign the special value `UNPROTECTED`, which instead makes the target object(s) inherit the SLA Domain from their parent. `-WhatIf` previews what a run would do without assigning anything.
 
 ## Prerequisites
 
@@ -43,14 +45,21 @@ Import-Module ./RubrikPolaris/RubrikPolaris.psd1
 ## Usage
 
 ```powershell
-# Assign an SLA Domain to a single SharePoint site by URL
+# Assign an SLA Domain to a single SharePoint site by URL (SharePoint is the default -ObjectType)
 ./AssignSLA.ps1 -PathToM365Module '<path_to_module>' -SubName '<m365_subscription_name>' -SlaDomain '<sla_domain_name>' -SearchByUrl '<site_url>'
 
-# Bulk-assign an SLA Domain to all sites listed in a CSV file
+# Assign an SLA Domain to a single OneDrive account or mailbox by user principal name / email
+./AssignSLA.ps1 -PathToM365Module '<path_to_module>' -SubName '<m365_subscription_name>' -SlaDomain '<sla_domain_name>' -ObjectType OneDrive -SearchByUrl '<user@tenant.com>'
+./AssignSLA.ps1 -PathToM365Module '<path_to_module>' -SubName '<m365_subscription_name>' -SlaDomain '<sla_domain_name>' -ObjectType Mailbox -SearchByUrl '<user@tenant.com>'
+
+# Bulk-assign an SLA Domain to all objects listed in a CSV file
 ./AssignSLA.ps1 -PathToM365Module '<path_to_module>' -SubName '<m365_subscription_name>' -SlaDomain '<sla_domain_name>' -InputFile '<path_to_csv>'
 
 # Either mode: pass 'UNPROTECTED' as -SlaDomain to inherit the SLA Domain from the parent instead
 ./AssignSLA.ps1 -PathToM365Module '<path_to_module>' -SubName '<m365_subscription_name>' -SlaDomain 'UNPROTECTED' -SearchByUrl '<site_url>'
+
+# Preview a bulk run without assigning anything
+./AssignSLA.ps1 -PathToM365Module '<path_to_module>' -SubName '<m365_subscription_name>' -SlaDomain '<sla_domain_name>' -InputFile '<path_to_csv>' -WhatIf
 ```
 
 ### Parameters
@@ -60,8 +69,15 @@ Import-Module ./RubrikPolaris/RubrikPolaris.psd1
 | `-PathToM365Module` | Yes | Path to the Rubrik PowerShell module for M365 protection. |
 | `-SubName` | Yes | Name of the Microsoft 365 subscription in RSC to work with. |
 | `-SlaDomain` | Yes | Name of the SLA Domain to assign, or `UNPROTECTED` to inherit from the parent. |
-| `-SearchByUrl` | One of `-SearchByUrl` / `-InputFile` required (mutually exclusive) | URL of a single SharePoint site to assign the SLA Domain to. |
-| `-InputFile` | One of `-SearchByUrl` / `-InputFile` required (mutually exclusive) | Path to a semicolon-delimited CSV file with `sitename;URL` columns listing sites to assign the SLA Domain to in bulk. |
+| `-SearchByUrl` | One of `-SearchByUrl` / `-InputFile` required (mutually exclusive) | Identifier of a single object to assign the SLA Domain to: a site URL for `-ObjectType SharePoint`, or a user principal name / email for `OneDrive` / `Mailbox`. |
+| `-InputFile` | One of `-SearchByUrl` / `-InputFile` required (mutually exclusive) | Path to a semicolon-delimited CSV file with `sitename;URL` columns listing objects to assign the SLA Domain to in bulk. |
+| `-ObjectType` | No (default `SharePoint`) | Type of M365 object to target: `SharePoint`, `OneDrive`, or `Mailbox`. See [Supported object types](#supported-object-types). |
+| `-WhatIf` | No | Preview the SLA assignments that would be made, without making them. |
+| `-Confirm` | No | Prompt for confirmation before each SLA assignment. |
+
+### Supported object types
+
+`-ObjectType` accepts `SharePoint` (default), `OneDrive`, or `Mailbox` — the three Microsoft 365 workloads for which `polaris-o365-powershell` exposes an object-listing cmdlet (`Get-PolarisM365SharePoint`, `Get-PolarisM365OneDrives`, `Get-PolarisM365Mailboxes`). **Teams is not supported**: the module has no `Get-PolarisM365Teams` cmdlet. A Team's file content lives in a SharePoint site, so protecting that Team is done today via `-ObjectType SharePoint` and the Team's site URL (see `sample-input.csv` for examples of Teams-backed sites).
 
 ### CSV input format
 
@@ -72,10 +88,33 @@ sitename;URL
 Site Display Name;https://tenant.sharepoint.com/sites/SiteName
 ```
 
+The `URL` column holds the identifier appropriate to `-ObjectType`: a SharePoint site URL for `SharePoint`, or a user principal name / email address for `OneDrive` / `Mailbox`.
+
+## Error handling
+
+- A bad `-SubName`, `-SlaDomain`, or (in single-object mode) an unresolved `-SearchByUrl` target stops the script immediately with a clear error and a non-zero exit code — nothing is assigned.
+- In bulk (`-InputFile`) mode, a row whose identifier doesn't match exactly one object, or whose SLA assignment call fails, is skipped with a `Write-Error` message naming the row; the rest of the batch still runs. A summary line at the end reports how many objects were assigned/skipped/declined, and if any row was skipped the script then throws (non-zero exit) so automation still sees the run as failed even though most of the batch succeeded.
+
+## Testing
+
+Pester tests live under [`Tests/`](./Tests) and mock the `polaris-o365-powershell` cmdlets via an in-memory stub module (`Tests/TestHelpers/RubrikPolarisStub`), so they run without a live RSC connection.
+
+```powershell
+Install-Module Pester, PSScriptAnalyzer -Scope CurrentUser -Force
+Invoke-Pester ./Tests
+Invoke-ScriptAnalyzer -Path ./AssignSLA.ps1
+```
+
+## CI
+
+[`.github/workflows/ci.yml`](./.github/workflows/ci.yml) runs on every push and pull request: it lints `AssignSLA.ps1` with PSScriptAnalyzer and runs the Pester suite, failing the build on any lint finding or test failure.
+
 ## Notes
 
 - The script connects to RSC via `Connect-Polaris`, which reads the service account credentials from `~/.rubrik/polaris-service-account.json`.
-- Matching sites by URL (rather than by name/search string) requires the `url` property on objects returned by `Get-PolarisM365SharePoint`. This property was added upstream in the `polaris-o365-powershell` module.
+- Matching objects by identifier (rather than by name/search string) requires the `url` / `userPrincipalName` properties on objects returned by the module's `Get-PolarisM365*` cmdlets. These were added in relatively recent versions of `polaris-o365-powershell`; if identifier-based matching fails to find *any* objects, check that your copy of the module is recent enough to return them.
+- If more than one object of the selected `-ObjectType` shares the same identifier, the script treats that as an error (single-object mode throws; bulk mode skips the row) rather than guessing which one to use.
+- Bulk (`-InputFile`) mode reports a `Declined` count in its summary alongside `Assigned`/`Skipped`, covering rows you (or `-WhatIf`) chose not to touch via `-Confirm`.
 
 ## License
 
