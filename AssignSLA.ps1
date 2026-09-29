@@ -126,7 +126,10 @@ function Invoke-M365SlaAssignment {
         return 'Assigned'
     }
     catch {
-        Write-Error "Failed to assign SLA Domain to $($Target.Name): $_"
+        # -ErrorAction Continue guarantees this stays non-terminating (so the caller's loop can
+        # keep going) regardless of the caller's ambient $ErrorActionPreference -- notably, CI
+        # runners commonly default pwsh steps to $ErrorActionPreference = 'Stop'.
+        Write-Error "Failed to assign SLA Domain to $($Target.Name): $_" -ErrorAction Continue
         return 'Failed'
     }
 }
@@ -218,7 +221,8 @@ if ($InputFile) {
     foreach ($row in $csv) {
         $resolved = Resolve-M365Target -Index $inventoryIndex -Identifier $row.url -ObjectType $ObjectType
         if (-not $resolved.Target) {
-            Write-Error "$($resolved.Error) (row '$($row.sitename)'); skipping."
+            # -ErrorAction Continue: see the comment in Invoke-M365SlaAssignment's catch block.
+            Write-Error "$($resolved.Error) (row '$($row.sitename)'); skipping." -ErrorAction Continue
             $skippedCount++
             continue
         }
