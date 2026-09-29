@@ -2,6 +2,7 @@ BeforeAll {
     $script:ScriptPath = (Resolve-Path (Join-Path $PSScriptRoot '..' 'AssignSLA.ps1')).Path
     $script:StubModulePath = (Resolve-Path (Join-Path $PSScriptRoot 'TestHelpers' 'RubrikPolarisStub' 'RubrikPolarisStub.psd1')).Path
     $script:BulkCsvPath = (Resolve-Path (Join-Path $PSScriptRoot 'Fixtures' 'bulk-sites.csv')).Path
+    $script:BulkCsvAllValidPath = (Resolve-Path (Join-Path $PSScriptRoot 'Fixtures' 'bulk-sites-all-valid.csv')).Path
 
     $script:Subscriptions = @([pscustomobject]@{ name = 'Contoso'; subscriptionId = 'sub-1' })
     $script:Slas = @(
@@ -84,6 +85,18 @@ Describe 'AssignSLA.ps1' {
                     -SearchByUrl 'https://contoso.sharepoint.com/sites/Missing'
             } | Should -Throw '*No SharePoint object matching*'
         }
+
+        It 'throws when the single-object identifier matches more than one object' {
+            Set-RubrikPolarisStubData -Subscriptions $script:Subscriptions -Slas $script:Slas -SharePointSites @(
+                [pscustomobject]@{ name = 'Site A'; url = 'https://contoso.sharepoint.com/sites/A'; id = 'site-a-id' },
+                [pscustomobject]@{ name = 'Site A (duplicate)'; url = 'https://contoso.sharepoint.com/sites/A'; id = 'site-a-dup-id' }
+            )
+
+            {
+                & $script:ScriptPath -PathToM365Module $script:StubModulePath -SubName 'Contoso' -SlaDomain 'Gold' `
+                    -SearchByUrl 'https://contoso.sharepoint.com/sites/A'
+            } | Should -Throw '*Multiple SharePoint objects matching*'
+        }
     }
 
     Context 'Single-object mode (-SearchByUrl)' {
@@ -117,7 +130,7 @@ Describe 'AssignSLA.ps1' {
     Context 'Bulk mode (-InputFile)' {
         It 'assigns the SLA Domain to every matched row in the CSV' {
             & $script:ScriptPath -PathToM365Module $script:StubModulePath -SubName 'Contoso' -SlaDomain 'Gold' `
-                -InputFile $script:BulkCsvPath -ErrorAction SilentlyContinue 2>$null
+                -InputFile $script:BulkCsvAllValidPath
 
             $assignments = @(Get-RubrikPolarisStubAssignments)
             $assignments.Count | Should -Be 2
@@ -125,19 +138,39 @@ Describe 'AssignSLA.ps1' {
             $assignments.ObjectID | Should -Contain 'site-b-id'
         }
 
-        It 'skips a row whose identifier cannot be resolved without aborting the rest of the batch' {
-            $scriptErrors = $null
-            & $script:ScriptPath -PathToM365Module $script:StubModulePath -SubName 'Contoso' -SlaDomain 'Gold' `
-                -InputFile $script:BulkCsvPath -ErrorAction SilentlyContinue -ErrorVariable scriptErrors 2>$null
+        It 'skips a row whose identifier cannot be resolved, still assigns the other rows, then reports the overall failure' {
+            $Error.Clear()
+
+            {
+                & $script:ScriptPath -PathToM365Module $script:StubModulePath -SubName 'Contoso' -SlaDomain 'Gold' `
+                    -InputFile $script:BulkCsvPath 2>$null
+            } | Should -Throw '*could not be assigned*'
 
             @(Get-RubrikPolarisStubAssignments).Count | Should -Be 2
-            @($scriptErrors).Count | Should -BeGreaterThan 0
-            ($scriptErrors -join ' ') | Should -Match 'Missing'
+            @($Error).Count | Should -BeGreaterThan 0
+            (($Error | ForEach-Object { $_.ToString() }) -join ' ') | Should -Match 'Missing'
+        }
+
+        It 'skips (without aborting) a row whose identifier matches more than one object' {
+            Set-RubrikPolarisStubData -Subscriptions $script:Subscriptions -Slas $script:Slas -SharePointSites @(
+                [pscustomobject]@{ name = 'Site A'; url = 'https://contoso.sharepoint.com/sites/A'; id = 'site-a-id' },
+                [pscustomobject]@{ name = 'Site A (duplicate)'; url = 'https://contoso.sharepoint.com/sites/A'; id = 'site-a-dup-id' },
+                [pscustomobject]@{ name = 'Site B'; url = 'https://contoso.sharepoint.com/sites/B'; id = 'site-b-id' }
+            )
+
+            {
+                & $script:ScriptPath -PathToM365Module $script:StubModulePath -SubName 'Contoso' -SlaDomain 'Gold' `
+                    -InputFile $script:BulkCsvAllValidPath 2>$null
+            } | Should -Throw '*could not be assigned*'
+
+            $assignments = @(Get-RubrikPolarisStubAssignments)
+            $assignments.Count | Should -Be 1
+            $assignments[0].ObjectID | Should -Be 'site-b-id'
         }
 
         It 'does not assign anything under -WhatIf' {
             & $script:ScriptPath -PathToM365Module $script:StubModulePath -SubName 'Contoso' -SlaDomain 'Gold' `
-                -InputFile $script:BulkCsvPath -WhatIf -ErrorAction SilentlyContinue 2>$null
+                -InputFile $script:BulkCsvAllValidPath -WhatIf
 
             @(Get-RubrikPolarisStubAssignments).Count | Should -Be 0
         }

@@ -93,7 +93,7 @@ The `URL` column holds the identifier appropriate to `-ObjectType`: a SharePoint
 ## Error handling
 
 - A bad `-SubName`, `-SlaDomain`, or (in single-object mode) an unresolved `-SearchByUrl` target stops the script immediately with a clear error and a non-zero exit code — nothing is assigned.
-- In bulk (`-InputFile`) mode, a row whose identifier doesn't match any object, or whose SLA assignment call fails, is skipped with a `Write-Error` message naming the row; the rest of the batch still runs. A summary line at the end reports how many objects were assigned vs. skipped/failed.
+- In bulk (`-InputFile`) mode, a row whose identifier doesn't match exactly one object, or whose SLA assignment call fails, is skipped with a `Write-Error` message naming the row; the rest of the batch still runs. A summary line at the end reports how many objects were assigned/skipped/declined, and if any row was skipped the script then throws (non-zero exit) so automation still sees the run as failed even though most of the batch succeeded.
 
 ## Testing
 
@@ -112,7 +112,9 @@ Invoke-ScriptAnalyzer -Path ./AssignSLA.ps1
 ## Notes
 
 - The script connects to RSC via `Connect-Polaris`, which reads the service account credentials from `~/.rubrik/polaris-service-account.json`.
-- Matching objects by identifier (rather than by name/search string) requires the `url` / `userPrincipalName` properties on objects returned by the module's `Get-PolarisM365*` cmdlets.
+- Matching objects by identifier (rather than by name/search string) requires the `url` / `userPrincipalName` properties on objects returned by the module's `Get-PolarisM365*` cmdlets. These were added in relatively recent versions of `polaris-o365-powershell`; if identifier-based matching fails to find *any* objects, check that your copy of the module is recent enough to return them.
+- If more than one object of the selected `-ObjectType` shares the same identifier, the script treats that as an error (single-object mode throws; bulk mode skips the row) rather than guessing which one to use.
+- Bulk (`-InputFile`) mode reports a `Declined` count in its summary alongside `Assigned`/`Skipped`, covering rows you (or `-WhatIf`) chose not to touch via `-Confirm`.
 
 ## License
 

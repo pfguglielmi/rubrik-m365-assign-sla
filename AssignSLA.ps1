@@ -45,6 +45,89 @@ function Get-M365ObjectInventory {
                               @{Name = 'Identifier'; Expression = { $_.userPrincipalName } },
                               @{Name = 'Id'; Expression = { $_.id } }
         }
+        default {
+            throw "Unsupported -ObjectType '$ObjectType'."
+        }
+    }
+}
+
+# Builds a lookup from Identifier to the (possibly more than one) inventory objects sharing it,
+# so callers can do an O(1) lookup per target instead of an O(n) scan, and detect ambiguous matches.
+function Get-M365ObjectIndex {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [array]$Inventory
+    )
+
+    $index = @{}
+    foreach ($obj in $Inventory) {
+        if (-not $index.ContainsKey($obj.Identifier)) {
+            $index[$obj.Identifier] = @()
+        }
+        $index[$obj.Identifier] += $obj
+    }
+    return $index
+}
+
+function Resolve-M365Target {
+    param(
+        [Parameter(Mandatory)]
+        [hashtable]$Index,
+        [Parameter(Mandatory)]
+        [string]$Identifier,
+        [Parameter(Mandatory)]
+        [string]$ObjectType
+    )
+
+    if (-not $Index.ContainsKey($Identifier)) {
+        return [pscustomobject]@{ Target = $null; Error = "No $ObjectType object matching '$Identifier' was found." }
+    }
+
+    $candidates = @($Index[$Identifier])
+    if ($candidates.Count -gt 1) {
+        return [pscustomobject]@{ Target = $null; Error = "Multiple $ObjectType objects matching '$Identifier' were found; unable to determine which one to use." }
+    }
+
+    return [pscustomobject]@{ Target = $candidates[0]; Error = $null }
+}
+
+# Performs (or, under -WhatIf/-Confirm, previews) a single SLA assignment and reports what happened,
+# so both the single-object and bulk code paths share identical ShouldProcess/error-handling behavior.
+# Takes the calling script's own $PSCmdlet (via -Cmdlet) so ShouldProcess reflects its -WhatIf/-Confirm
+# state; SupportsShouldProcess is declared here too only to satisfy PSScriptAnalyzer's ShouldProcess rule.
+function Invoke-M365SlaAssignment {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)]
+        $Target,
+        [Parameter(Mandatory)]
+        [string]$ObjectType,
+        [Parameter(Mandatory)]
+        [string]$SlaDomain,
+        [Parameter(Mandatory)]
+        [string]$SlaIdToAssign,
+        [Parameter(Mandatory)]
+        $Cmdlet
+    )
+
+    if (-not $Cmdlet.ShouldProcess($Target.Name, "Assign SLA Domain '$SlaDomain'")) {
+        return 'Declined'
+    }
+
+    if ($SlaDomain -eq 'UNPROTECTED') {
+        Write-Host "Inheriting SLA Domain from parent and assigning it to $ObjectType object" $Target.Name "which identifier is" $Target.Identifier
+    } else {
+        Write-Host "Assigning SLA Domain" $SlaDomain "to $ObjectType object" $Target.Name "which identifier is" $Target.Identifier
+    }
+
+    try {
+        Set-PolarisM365ObjectSla -ObjectID $Target.Id -SlaID $SlaIdToAssign -ErrorAction Stop
+        return 'Assigned'
+    }
+    catch {
+        Write-Error "Failed to assign SLA Domain to $($Target.Name): $_"
+        return 'Failed'
     }
 }
 
@@ -101,25 +184,25 @@ if ($SlaDomain -ne 'UNPROTECTED') {
     }
     $sla = $matchingSlas[0]
 }
-$slaIdToAssign = if ($SlaDomain -eq 'UNPROTECTED') { $SlaDomain } else { $sla.id }
+# Forward the canonical sentinel (rather than the user's original casing) since -eq/-ne above
+# already matched it case-insensitively, but the value we hand to Set-PolarisM365ObjectSla should
+# be unambiguous regardless of how that cmdlet implements its own sentinel comparison.
+$slaIdToAssign = if ($SlaDomain -eq 'UNPROTECTED') { 'UNPROTECTED' } else { $sla.id }
+
+$inventoryIndex = Get-M365ObjectIndex -Inventory @(Get-M365ObjectInventory -ObjectType $ObjectType -SubscriptionId $sub.subscriptionId)
 
 # Assign the SLA Domain to the single object specified by the -SearchByUrl parameter
 # (the site URL for -ObjectType SharePoint, or the user's email/UPN for OneDrive/Mailbox)
 if ($SearchByUrl) {
-    $inventory = Get-M365ObjectInventory -ObjectType $ObjectType -SubscriptionId $sub.subscriptionId
-    $target = $inventory | Where-Object Identifier -eq $SearchByUrl
-
-    if (-not $target) {
-        throw "No $ObjectType object matching '$SearchByUrl' was found in subscription '$SubName'."
+    $resolved = Resolve-M365Target -Index $inventoryIndex -Identifier $SearchByUrl -ObjectType $ObjectType
+    if (-not $resolved.Target) {
+        throw $resolved.Error
     }
 
-    if ($PSCmdlet.ShouldProcess($target.Name, "Assign SLA Domain '$SlaDomain'")) {
-        if ($SlaDomain -eq 'UNPROTECTED') {
-            Write-Host "Inheriting SLA Domain from parent and assigning it to $ObjectType object" $target.Name "which identifier is" $target.Identifier
-        } else {
-            Write-Host "Assigning SLA Domain" $SlaDomain "to $ObjectType object" $target.Name "which identifier is" $target.Identifier
-        }
-        Set-PolarisM365ObjectSla -ObjectID $target.Id -SlaID $slaIdToAssign
+    $status = Invoke-M365SlaAssignment -Target $resolved.Target -ObjectType $ObjectType -SlaDomain $SlaDomain `
+        -SlaIdToAssign $slaIdToAssign -Cmdlet $PSCmdlet
+    if ($status -eq 'Failed') {
+        throw "Failed to assign SLA Domain '$SlaDomain' to $($resolved.Target.Name)."
     }
 }
 
@@ -127,36 +210,31 @@ if ($SearchByUrl) {
 if ($InputFile) {
     # Import the csv file that contains the list of Microsoft 365 objects to protect
     $csv = Import-Csv -Path $InputFile -Delimiter ';' | Select-Object sitename, URL
-    $inventory = Get-M365ObjectInventory -ObjectType $ObjectType -SubscriptionId $sub.subscriptionId
 
     $assignedCount = 0
+    $declinedCount = 0
     $skippedCount = 0
 
     foreach ($row in $csv) {
-        $target = $inventory | Where-Object Identifier -eq $row.url
-
-        if (-not $target) {
-            Write-Error "No $ObjectType object matching '$($row.url)' (row '$($row.sitename)') was found; skipping."
+        $resolved = Resolve-M365Target -Index $inventoryIndex -Identifier $row.url -ObjectType $ObjectType
+        if (-not $resolved.Target) {
+            Write-Error "$($resolved.Error) (row '$($row.sitename)'); skipping."
             $skippedCount++
             continue
         }
 
-        if ($PSCmdlet.ShouldProcess($target.Name, "Assign SLA Domain '$SlaDomain'")) {
-            if ($SlaDomain -eq 'UNPROTECTED') {
-                Write-Host "Inheriting SLA Domain from parent and assigning it to $ObjectType object" $target.Name "which identifier is" $target.Identifier
-            } else {
-                Write-Host "Assigning SLA Domain" $SlaDomain "to $ObjectType object" $target.Name "which identifier is" $target.Identifier
-            }
-            try {
-                Set-PolarisM365ObjectSla -ObjectID $target.Id -SlaID $slaIdToAssign -ErrorAction Stop
-                $assignedCount++
-            }
-            catch {
-                Write-Error "Failed to assign SLA Domain to $($target.Name): $_"
-                $skippedCount++
-            }
+        $status = Invoke-M365SlaAssignment -Target $resolved.Target -ObjectType $ObjectType -SlaDomain $SlaDomain `
+            -SlaIdToAssign $slaIdToAssign -Cmdlet $PSCmdlet
+        switch ($status) {
+            'Assigned' { $assignedCount++ }
+            'Declined' { $declinedCount++ }
+            'Failed' { $skippedCount++ }
         }
     }
 
-    Write-Host "Done. Assigned: $assignedCount. Skipped/failed: $skippedCount."
+    Write-Host "Done. Assigned: $assignedCount. Skipped/failed: $skippedCount. Declined: $declinedCount."
+
+    if ($skippedCount -gt 0) {
+        throw "$skippedCount of $($csv.Count) objects in '$InputFile' could not be assigned the SLA Domain '$SlaDomain'. See the errors above."
+    }
 }
