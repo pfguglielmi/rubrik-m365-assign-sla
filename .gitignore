@@ -5,9 +5,10 @@ polaris-service-account.json
 # Real customer/tenant data exports - do not commit
 Selected sites for test backup.csv
 
-# Any other CSVs except the sanitized sample
+# Any other CSVs except the sanitized sample and synthetic test fixtures
 *.csv
 !sample-input.csv
+!Tests/Fixtures/*.csv
 
 # Google Docs shortcut files (not real content)
 *.gdoc
